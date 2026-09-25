@@ -1,6 +1,6 @@
 ---
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: 2025 The Linux Foundation
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
 
 # Action test/validation workflow
 name: "Test GitHub Action 🧪"
@@ -19,24 +19,23 @@ concurrency:
 
 permissions: {}
 
+# CI holds no crates.io credentials, so every run below is a dry run or
+# a deliberate failure. 'cargo publish --dry-run' reads the crates.io
+# index, which the egress allow-list must admit.
 jobs:
-  ### Test the GitHub Action in this Repository ###
-  tests:
-    name: "Test local GitHub Action"
+  ### Unit tests: scripts against a cargo stand-in ###
+  unit-tests:
+    name: "Unit tests (bats)"
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    timeout-minutes: 10 # Increase this timeout value as needed
+    timeout-minutes: 10
     steps:
-      # Load the egress allow-list out-of-band from the
-      # organisation's .github repository and publish it as
-      # $CONNECTION_ALLOW_LIST for the harden-runner step below.
       # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@805eedb0508c07714b61887a2b87a5c4bbeff22a  # v0.12.1
+      - uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22  # v0.12.2
         with:
-          config: '@18d9c4446bea555d0783e850f6d295f844fe8f67'  # v0.1.1
+          config: '@beca7ffe87eac9212c70fe52d0d38d3bd61bf9d1'  # v0.16.2
 
-      # Harden the runner with the just-loaded allow-list.
       - name: 'Harden runner (block)'
         # yamllint disable-line rule:line-length
         uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
@@ -50,41 +49,364 @@ jobs:
         with:
           persist-credentials: false
 
-      # Perform setup prior to running test(s)
-      - name: "Testing setup step"
+      - name: "Install bats"
         shell: bash
         run: |
-          # Testing setup step
-          echo "Testing setup step"
-          echo "Testing setup step/summary output" >> "$GITHUB_STEP_SUMMARY"
+          # Install bats
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bats
+          bats --version
 
-      - name: "Running local action: ${{ github.repository }}"
+      - name: "Run bats tests"
+        shell: bash
+        run: |
+          # Run bats tests
+          bats tests/
+
+  ### Dry runs against a generated workspace fixture ###
+  test-workspace-fixture:
+    name: "Test: dry run (generated workspace)"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22  # v0.12.2
+        with:
+          config: '@beca7ffe87eac9212c70fe52d0d38d3bd61bf9d1'  # v0.16.2
+
+      - name: 'Harden runner (block)'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Two members with distinct versions prove the action selects the
+      # requested manifest rather than the first workspace member. Cargo
+      # refuses to package files git reports as uncommitted, and these
+      # sit untracked inside this checkout, so they get a repository of
+      # their own.
+      - name: "Create workspace fixture"
+        shell: bash
+        run: |
+          # Create workspace fixture
+          set -euo pipefail
+          mkdir -p fixture
+          printf '%s\n' '[workspace]' 'members = ["crates/*"]' \
+            'resolver = "2"' > fixture/Cargo.toml
+          for member in alpha:0.1.0 beta:0.2.0; do
+            name="${member%%:*}"
+            version="${member#*:}"
+            dir="fixture/crates/$name"
+            mkdir -p "$dir/src"
+            printf '%s\n' '[package]' \
+              "name = \"lfreleng-publish-fixture-$name\"" \
+              "version = \"$version\"" 'edition = "2021"' \
+              'description = "Fixture for rust-crate-publish-action"' \
+              'license = "Apache-2.0"' > "$dir/Cargo.toml"
+            printf '%s\n' 'pub fn fixture() -> u8 { 1 }' > "$dir/src/lib.rs"
+          done
+          printf '%s\n' '/target' > fixture/.gitignore
+          cargo generate-lockfile --offline --manifest-path fixture/Cargo.toml
+          git -C fixture init -q
+          git -C fixture add -A
+          git -C fixture -c user.name=CI -c user.email=ci@example.org \
+            -c commit.gpgsign=false commit -q -m 'Fixture'
+
+      - name: "Running local action: workspace member by manifest_path"
+        id: beta
         uses: $/
         with:
-          input: "test input 💬"
+          path_prefix: fixture
+          manifest_path: crates/beta/Cargo.toml
+          release_tag: v0.2.0
+          dry_run: 'true'
 
-      - name: "Validated local action: ${{ github.repository }}"
+      - name: "Running local action: member directory as path_prefix"
+        id: alpha
+        uses: $/
+        with:
+          path_prefix: fixture/crates/alpha
+          release_tag: '0.1.0'
+          dry_run: 'true'
+
+      - name: "Verify dry-run outputs"
         shell: bash
         env:
-          REPO: ${{ github.repository }}
+          BETA_NAME: ${{ steps.beta.outputs.crate_name }}
+          BETA_VERSION: ${{ steps.beta.outputs.crate_version }}
+          BETA_SIZE: ${{ steps.beta.outputs.crate_size_bytes }}
+          BETA_PUBLISHED: ${{ steps.beta.outputs.published }}
+          ALPHA_NAME: ${{ steps.alpha.outputs.crate_name }}
+          ALPHA_VERSION: ${{ steps.alpha.outputs.crate_version }}
+          ALPHA_PUBLISHED: ${{ steps.alpha.outputs.published }}
         run: |
-          # Local action validation
-          echo "Validated local action: $REPO"
-          echo "Validation step summary output" >> "$GITHUB_STEP_SUMMARY"
+          # Verify dry-run outputs
+          errors=0
+          check() {
+            if [ "$2" != "$3" ]; then
+              echo "Unexpected $1: '$2' (expected '$3') ❌"
+              errors=1
+            fi
+          }
+          check "beta crate_name" "$BETA_NAME" lfreleng-publish-fixture-beta
+          check "beta crate_version" "$BETA_VERSION" 0.2.0
+          check "beta published" "$BETA_PUBLISHED" false
+          check "alpha crate_name" "$ALPHA_NAME" lfreleng-publish-fixture-alpha
+          check "alpha crate_version" "$ALPHA_VERSION" 0.1.0
+          check "alpha published" "$ALPHA_PUBLISHED" false
+          if [[ ! "$BETA_SIZE" =~ ^[1-9][0-9]*$ ]]; then
+            echo "Unexpected beta crate_size_bytes: '$BETA_SIZE' ❌"
+            errors=1
+          fi
+          if [ "$errors" != 0 ]; then
+            echo "Workspace fixture tests failed ❌" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Workspace fixture dry runs verified ✅"
+          echo "Workspace fixture dry runs verified ✅" >> "$GITHUB_STEP_SUMMARY"
 
+  ### Dry run against the shared test project ###
+  test-rust-project:
+    name: "Test: dry run (test-rust-project)"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
       # yamllint disable-line rule:line-length
-      - name: "Running local action: ${{ github.repository }} [Override Failure]"
-        uses: $/
-        id: failure
-        continue-on-error: true
+      - uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22  # v0.12.2
         with:
-          invalid_input: "Some garbage"
+          config: '@beca7ffe87eac9212c70fe52d0d38d3bd61bf9d1'  # v0.16.2
 
-      # Failure testing is also important
-      - name: "Error if step above did NOT fail"
-        if: steps.failure.outcome == 'success'
+      - name: 'Harden runner (block)'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: "Checkout test project"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: "lfreleng-actions/test-rust-project"
+          path: "test-rust-project"
+          persist-credentials: false
+
+      - name: "Running local action: dry run"
+        id: dry-run
+        uses: $/
+        with:
+          path_prefix: test-rust-project
+          dry_run: 'true'
+
+      # Feed the discovered version back in as a release tag, so the
+      # check passes whatever version the test project carries.
+      - name: "Running local action: dry run with matching release tag"
+        id: tagged
+        uses: $/
+        with:
+          path_prefix: test-rust-project
+          release_tag: "v${{ steps.dry-run.outputs.crate_version }}"
+          dry_run: 'true'
+
+      - name: "Verify dry-run outputs"
+        shell: bash
+        env:
+          CRATE_NAME: ${{ steps.dry-run.outputs.crate_name }}
+          CRATE_VERSION: ${{ steps.dry-run.outputs.crate_version }}
+          CRATE_SIZE: ${{ steps.dry-run.outputs.crate_size_bytes }}
+          PUBLISHED: ${{ steps.dry-run.outputs.published }}
+          TAGGED_PUBLISHED: ${{ steps.tagged.outputs.published }}
+        run: |
+          # Verify dry-run outputs
+          errors=0
+          if [ -z "$CRATE_NAME" ] || [ -z "$CRATE_VERSION" ]; then
+            echo "Missing crate_name or crate_version output ❌"
+            errors=1
+          fi
+          if [[ ! "$CRATE_SIZE" =~ ^[1-9][0-9]*$ ]]; then
+            echo "Unexpected crate_size_bytes: '$CRATE_SIZE' ❌"
+            errors=1
+          fi
+          if [ "$PUBLISHED" != false ] || [ "$TAGGED_PUBLISHED" != false ]; then
+            echo "A dry run reported a publish ❌"
+            errors=1
+          fi
+          if [ "$errors" != 0 ]; then
+            echo "test-rust-project dry runs failed ❌" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Dry run verified: $CRATE_NAME $CRATE_VERSION ✅"
+          echo "Dry run verified: $CRATE_NAME $CRATE_VERSION ✅" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+  ### Invalid inputs and failed checks must fail closed ###
+  # Every case fails before 'cargo publish --dry-run', so this job
+  # needs no crates.io access.
+  test-failures:
+    name: "Test: invalid inputs and error handling"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22  # v0.12.2
+        with:
+          config: '@beca7ffe87eac9212c70fe52d0d38d3bd61bf9d1'  # v0.16.2
+
+      - name: 'Harden runner (block)'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Committed in a repository of its own; see the workspace fixture
+      - name: "Create minimal crate fixture"
         shell: bash
         run: |
-          # Error if step above did NOT fail
-          echo "Error: previous test step did NOT fail ❌"
-          exit 1
+          # Create minimal crate fixture
+          set -euo pipefail
+          mkdir -p minimal/src
+          printf '%s\n' '[package]' 'name = "lfreleng-publish-fixture"' \
+            'version = "1.0.0"' 'edition = "2021"' \
+            'description = "Fixture for rust-crate-publish-action"' \
+            'license = "Apache-2.0"' > minimal/Cargo.toml
+          : > minimal/src/lib.rs
+          printf '%s\n' '/target' > minimal/.gitignore
+          cargo generate-lockfile --offline --manifest-path minimal/Cargo.toml
+          git -C minimal init -q
+          git -C minimal add -A
+          git -C minimal -c user.name=CI -c user.email=ci@example.org \
+            -c commit.gpgsign=false commit -q -m 'Fixture'
+
+      - name: "Running local action: non-boolean dry_run"
+        id: bad-dry-run
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: minimal
+          dry_run: 'TRUE'
+
+      - name: "Running local action: path_prefix outside the workspace"
+        id: escape-path
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: /etc
+          dry_run: 'true'
+
+      - name: "Running local action: manifest_path not a Cargo.toml"
+        id: bad-manifest
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: minimal
+          manifest_path: src/lib.rs
+          dry_run: 'true'
+
+      - name: "Running local action: release_tag injection"
+        id: bad-tag
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: minimal
+          release_tag: 'v1.0.0; touch injected'
+          dry_run: 'true'
+
+      - name: "Running local action: mismatched release_tag"
+        id: tag-mismatch
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: minimal
+          release_tag: v9.9.9
+          dry_run: 'true'
+
+      - name: "Running local action: package over max_crate_size_bytes"
+        id: oversize
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: minimal
+          max_crate_size_bytes: '1'
+          dry_run: 'true'
+
+      - name: "Running local action: failed check with permit_fail"
+        id: permitted
+        uses: $/
+        with:
+          path_prefix: minimal
+          release_tag: v9.9.9
+          dry_run: 'true'
+          permit_fail: 'true'
+
+      - name: "Verify failures were reported"
+        shell: bash
+        env:
+          DRY_RUN_OUTCOME: ${{ steps.bad-dry-run.outcome }}
+          ESCAPE_OUTCOME: ${{ steps.escape-path.outcome }}
+          MANIFEST_OUTCOME: ${{ steps.bad-manifest.outcome }}
+          TAG_OUTCOME: ${{ steps.bad-tag.outcome }}
+          MISMATCH_OUTCOME: ${{ steps.tag-mismatch.outcome }}
+          OVERSIZE_OUTCOME: ${{ steps.oversize.outcome }}
+          OVERSIZE_SIZE: ${{ steps.oversize.outputs.crate_size_bytes }}
+          PERMITTED_OUTCOME: ${{ steps.permitted.outcome }}
+          PERMITTED_PUBLISHED: ${{ steps.permitted.outputs.published }}
+        run: |
+          # Failure testing is also important; each case MUST fail
+          errors=0
+          for pair in "dry_run:$DRY_RUN_OUTCOME" \
+            "path_prefix:$ESCAPE_OUTCOME" \
+            "manifest_path:$MANIFEST_OUTCOME" \
+            "release_tag injection:$TAG_OUTCOME" \
+            "release_tag mismatch:$MISMATCH_OUTCOME" \
+            "max_crate_size_bytes:$OVERSIZE_OUTCOME"; do
+            if [ "${pair##*:}" != failure ]; then
+              echo "Case '${pair%:*}' did not fail (${pair##*:}) ❌"
+              errors=1
+            fi
+          done
+          if [ -e injected ] || [ -e minimal/injected ]; then
+            echo "release_tag reached a shell ❌"
+            errors=1
+          fi
+          # The oversize case fails after measuring, so it still
+          # reports the size it rejected
+          if [[ ! "$OVERSIZE_SIZE" =~ ^[1-9][0-9]*$ ]]; then
+            echo "Oversize case reported no crate_size_bytes ❌"
+            errors=1
+          fi
+          if [ "$PERMITTED_OUTCOME" != success ] \
+            || [ "$PERMITTED_PUBLISHED" != false ]; then
+            echo "permit_fail did not report a permitted failure ❌"
+            errors=1
+          fi
+          if [ "$errors" != 0 ]; then
+            echo "Failure-path tests failed ❌" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Failures correctly reported ✅"
+          echo "Failures correctly reported ✅" >> "$GITHUB_STEP_SUMMARY"

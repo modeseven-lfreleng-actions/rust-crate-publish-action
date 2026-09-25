@@ -1,53 +1,87 @@
 ---
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: 2025 The Linux Foundation
+# SPDX-License-Identifier: Apache-2.0 AND MIT
+# SPDX-FileCopyrightText: 2026 Overture Maps
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
 
-# actions-template
-name: "🛠️ Actions Template"
-description: "Description of action"
-# Any relevant notes/observations can go here
+# rust-crate-publish-action
+name: "🦀 Rust Crate Publish"
+# yamllint disable-line rule:line-length
+description: "Packages a Rust crate, checks its size and version, and publishes it to crates.io"
+# Stages: read metadata, verify the release tag, 'cargo package' (the
+# one compiling stage), check the .crate size, 'cargo publish
+# --dry-run', then the real upload. Registry tokens and GitHub OIDC
+# request variables reach the upload alone, never the build scripts.
+# The calling workflow owns authentication, typically crates.io
+# Trusted Publishing via rust-lang/crates-io-auth-action.
 
 inputs:
-  input:
-    description: "Description of input"
-    required: true
+  # Optional
+  path_prefix:
+    # yamllint disable-line rule:line-length
+    description: "Directory holding the crate or workspace, inside the workspace"
+    required: false
+    default: "."
+  manifest_path:
+    description: "Path to the crate's Cargo.toml, relative to path_prefix"
+    required: false
+    default: "Cargo.toml"
+  release_tag:
+    # yamllint disable-line rule:line-length
+    description: "Release tag that the Cargo.toml version must match, one leading 'v' ignored; empty skips the check"
+    required: false
+    default: ""
+  max_crate_size_bytes:
+    # yamllint disable-line rule:line-length
+    description: "Largest allowed packaged .crate size in bytes (crates.io cap: 10MB)"
+    required: false
+    default: "10485760"
+  dry_run:
+    # yamllint disable-line rule:line-length
+    description: "Check and package without publishing ('true'/'false'); needs no credentials"
+    required: false
+    default: "false"
+  registry_token:
+    # yamllint disable-line rule:line-length
+    description: "crates.io token for the upload alone; empty uses the caller's Cargo credentials"
+    required: false
+    default: ""
+  permit_fail:
+    description: "Report success even when a stage fails ('true'/'false')"
+    required: false
+    default: "false"
+  summary:
+    description: "Write a crate table to the job summary ('true'/'false')"
+    required: false
+    default: "true"
 
 outputs:
-  output:
-    description: "Description of output"
-    value: ${{ steps.code.outputs.output }}
+  crate_name:
+    description: "Crate name, read from its Cargo.toml"
+    value: ${{ steps.publish.outputs.crate_name }}
+  crate_version:
+    description: "Crate version, read from its Cargo.toml"
+    value: ${{ steps.publish.outputs.crate_version }}
+  crate_size_bytes:
+    description: "Packaged .crate file size in bytes"
+    value: ${{ steps.publish.outputs.crate_size_bytes }}
+  published:
+    description: "'true' when the crate reached crates.io, otherwise 'false'"
+    value: ${{ steps.publish.outputs.published }}
 
 runs:
   using: "composite"
   steps:
-    - name: "Friendly Name"
-      id: code
+    - name: "Check, package and publish crate"
+      id: publish
       shell: bash
       env:
-        INPUT_VALUE: ${{ inputs.input }}
-      run: |
-        # Friendly Name
-        input="$INPUT_VALUE"
-        if [ -z "$input" ]; then
-          echo "Error: mandatory input was not set/configured ❌"
-          exit 1
-        fi
-
-        # Write the output using the multiline heredoc format with a random
-        # delimiter so that an input containing newlines cannot inject
-        # additional keys into $GITHUB_OUTPUT (output-file injection). The
-        # delimiter is built from shell-builtin randomness (no external
-        # tools such as openssl/uuidgen, which are not guaranteed on
-        # self-hosted runners) and regenerated until it is provably absent
-        # from the value being emitted.
-        delimiter="ghadelim_${RANDOM}${RANDOM}${RANDOM}${RANDOM}"
-        while [[ "$input" == *"$delimiter"* ]]; do
-          delimiter="ghadelim_${RANDOM}${RANDOM}${RANDOM}${RANDOM}"
-        done
-        {
-          printf '%s<<%s\n' 'output' "$delimiter"
-          printf '%s\n' "$input"
-          printf '%s\n' "$delimiter"
-        } >> "$GITHUB_OUTPUT"
-        echo "Action received: $input ✅"
-        echo "Action received: $input ✅" >> "$GITHUB_STEP_SUMMARY"
+        ACTION_PATH: ${{ github.action_path }}
+        INPUT_PATH_PREFIX: ${{ inputs.path_prefix }}
+        INPUT_MANIFEST_PATH: ${{ inputs.manifest_path }}
+        INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
+        INPUT_MAX_CRATE_SIZE_BYTES: ${{ inputs.max_crate_size_bytes }}
+        INPUT_DRY_RUN: ${{ inputs.dry_run }}
+        INPUT_REGISTRY_TOKEN: ${{ inputs.registry_token }}
+        INPUT_PERMIT_FAIL: ${{ inputs.permit_fail }}
+        INPUT_SUMMARY: ${{ inputs.summary }}
+      run: bash "$ACTION_PATH/scripts/publish-crate.sh"

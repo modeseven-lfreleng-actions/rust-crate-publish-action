@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+
+version = 1
+
+# JSON admits no comment syntax, so this fixture carries its copyright
+# and licence information here rather than in a header. It derives from
+# the Overture Maps original, as the other test files do.
+[[annotations]]
+path = ["tests/fixtures/manifest.json"]
+precedence = "aggregate"
+SPDX-FileCopyrightText = [
+  "2026 Overture Maps",
+  "2026 The Linux Foundation",
+]
+SPDX-License-Identifier = "Apache-2.0 AND MIT"
