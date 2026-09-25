@@ -19,7 +19,7 @@
 set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-# shellcheck source=scripts/job-summary.sh
+# shellcheck source=job-summary.sh
 source "$script_dir/job-summary.sh"
 
 path_prefix="${INPUT_PATH_PREFIX:-.}"
