@@ -34,7 +34,7 @@ jobs:
       # yamllint disable-line rule:line-length
       - uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22  # v0.12.2
         with:
-          config: '@beca7ffe87eac9212c70fe52d0d38d3bd61bf9d1'  # v0.16.2
+          config: '@2fbf4b0c1098f5e658b75ac019bb039b76fee9b6'  # v0.16.3
 
       - name: 'Harden runner (block)'
         # yamllint disable-line rule:line-length
@@ -74,7 +74,7 @@ jobs:
       # yamllint disable-line rule:line-length
       - uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22  # v0.12.2
         with:
-          config: '@beca7ffe87eac9212c70fe52d0d38d3bd61bf9d1'  # v0.16.2
+          config: '@2fbf4b0c1098f5e658b75ac019bb039b76fee9b6'  # v0.16.3
 
       - name: 'Harden runner (block)'
         # yamllint disable-line rule:line-length
@@ -138,12 +138,25 @@ jobs:
           release_tag: '0.1.0'
           dry_run: 'true'
 
+      # The two-job publishing pattern in one job: feed a verified run's
+      # digest back in, so the action packages without compiling.
+      - name: "Running local action: expected_sha256 from a verified run"
+        id: beta-digest
+        uses: $/
+        with:
+          path_prefix: fixture
+          manifest_path: crates/beta/Cargo.toml
+          expected_sha256: ${{ steps.beta.outputs.crate_sha256 }}
+          dry_run: 'true'
+
       - name: "Verify dry-run outputs"
         shell: bash
         env:
           BETA_NAME: ${{ steps.beta.outputs.crate_name }}
           BETA_VERSION: ${{ steps.beta.outputs.crate_version }}
           BETA_SIZE: ${{ steps.beta.outputs.crate_size_bytes }}
+          BETA_SHA256: ${{ steps.beta.outputs.crate_sha256 }}
+          DIGEST_SHA256: ${{ steps.beta-digest.outputs.crate_sha256 }}
           BETA_PUBLISHED: ${{ steps.beta.outputs.published }}
           ALPHA_NAME: ${{ steps.alpha.outputs.crate_name }}
           ALPHA_VERSION: ${{ steps.alpha.outputs.crate_version }}
@@ -167,6 +180,12 @@ jobs:
             echo "Unexpected beta crate_size_bytes: '$BETA_SIZE' ❌"
             errors=1
           fi
+          if [[ ! "$BETA_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "Unexpected beta crate_sha256: '$BETA_SHA256' ❌"
+            errors=1
+          fi
+          check "expected_sha256 run crate_sha256" \
+            "$DIGEST_SHA256" "$BETA_SHA256"
           if [ "$errors" != 0 ]; then
             echo "Workspace fixture tests failed ❌" >> "$GITHUB_STEP_SUMMARY"
             exit 1
@@ -185,7 +204,7 @@ jobs:
       # yamllint disable-line rule:line-length
       - uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22  # v0.12.2
         with:
-          config: '@beca7ffe87eac9212c70fe52d0d38d3bd61bf9d1'  # v0.16.2
+          config: '@2fbf4b0c1098f5e658b75ac019bb039b76fee9b6'  # v0.16.3
 
       - name: 'Harden runner (block)'
         # yamllint disable-line rule:line-length
@@ -268,7 +287,7 @@ jobs:
       # yamllint disable-line rule:line-length
       - uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22  # v0.12.2
         with:
-          config: '@beca7ffe87eac9212c70fe52d0d38d3bd61bf9d1'  # v0.16.2
+          config: '@2fbf4b0c1098f5e658b75ac019bb039b76fee9b6'  # v0.16.3
 
       - name: 'Harden runner (block)'
         # yamllint disable-line rule:line-length
@@ -354,6 +373,16 @@ jobs:
           max_crate_size_bytes: '1'
           dry_run: 'true'
 
+      - name: "Running local action: archive differs from expected_sha256"
+        id: digest-mismatch
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: minimal
+          # yamllint disable-line rule:line-length
+          expected_sha256: '0000000000000000000000000000000000000000000000000000000000000000'
+          dry_run: 'true'
+
       - name: "Running local action: failed check with permit_fail"
         id: permitted
         uses: $/
@@ -373,6 +402,7 @@ jobs:
           MISMATCH_OUTCOME: ${{ steps.tag-mismatch.outcome }}
           OVERSIZE_OUTCOME: ${{ steps.oversize.outcome }}
           OVERSIZE_SIZE: ${{ steps.oversize.outputs.crate_size_bytes }}
+          DIGEST_OUTCOME: ${{ steps.digest-mismatch.outcome }}
           PERMITTED_OUTCOME: ${{ steps.permitted.outcome }}
           PERMITTED_PUBLISHED: ${{ steps.permitted.outputs.published }}
         run: |
@@ -383,7 +413,8 @@ jobs:
             "manifest_path:$MANIFEST_OUTCOME" \
             "release_tag injection:$TAG_OUTCOME" \
             "release_tag mismatch:$MISMATCH_OUTCOME" \
-            "max_crate_size_bytes:$OVERSIZE_OUTCOME"; do
+            "max_crate_size_bytes:$OVERSIZE_OUTCOME" \
+            "expected_sha256:$DIGEST_OUTCOME"; do
             if [ "${pair##*:}" != failure ]; then
               echo "Case '${pair%:*}' did not fail (${pair##*:}) ❌"
               errors=1

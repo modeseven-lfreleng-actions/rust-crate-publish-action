@@ -7,10 +7,11 @@
 name: "🦀 Rust Crate Publish"
 # yamllint disable-line rule:line-length
 description: "Packages a Rust crate, checks its size and version, and publishes it to crates.io"
-# Stages: read metadata, verify the release tag, 'cargo package' (the
-# one compiling stage), check the .crate size, 'cargo publish
-# --dry-run', then the real upload. Registry tokens and GitHub OIDC
-# request variables reach the upload alone, never the build scripts.
+# Stages: read metadata, verify the release tag, 'cargo package', check
+# the .crate size, 'cargo publish --dry-run', confirm the archive is
+# unchanged, then upload. For isolation from crate code, verify in an
+# unprivileged dry_run job and upload from a credentialed job given
+# expected_sha256, which compiles nothing.
 # The calling workflow owns authentication, typically crates.io
 # Trusted Publishing via rust-lang/crates-io-auth-action.
 
@@ -45,6 +46,11 @@ inputs:
     description: "crates.io token for the upload alone; empty uses the caller's Cargo credentials"
     required: false
     default: ""
+  expected_sha256:
+    # yamllint disable-line rule:line-length
+    description: "crate_sha256 from an earlier dry_run job; skips compilation and uploads only that archive"
+    required: false
+    default: ""
   permit_fail:
     description: "Report success even when a stage fails ('true'/'false')"
     required: false
@@ -64,6 +70,9 @@ outputs:
   crate_size_bytes:
     description: "Packaged .crate file size in bytes"
     value: ${{ steps.publish.outputs.crate_size_bytes }}
+  crate_sha256:
+    description: "SHA-256 of the verified .crate, as crates.io records it"
+    value: ${{ steps.publish.outputs.crate_sha256 }}
   published:
     description: "'true' when the crate reached crates.io, otherwise 'false'"
     value: ${{ steps.publish.outputs.published }}
@@ -82,6 +91,7 @@ runs:
         INPUT_MAX_CRATE_SIZE_BYTES: ${{ inputs.max_crate_size_bytes }}
         INPUT_DRY_RUN: ${{ inputs.dry_run }}
         INPUT_REGISTRY_TOKEN: ${{ inputs.registry_token }}
+        INPUT_EXPECTED_SHA256: ${{ inputs.expected_sha256 }}
         INPUT_PERMIT_FAIL: ${{ inputs.permit_fail }}
         INPUT_SUMMARY: ${{ inputs.summary }}
       run: bash "$ACTION_PATH/scripts/publish-crate.sh"

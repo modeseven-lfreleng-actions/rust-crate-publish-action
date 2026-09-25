@@ -9,12 +9,13 @@
 # Stages run in order, and the first failure stops the run:
 #
 #   Check inputs -> Read crate metadata -> Verify release tag
-#   -> Package -> Check package size -> Dry-run publish -> Publish
+#   -> Package -> Check package size -> Match verified digest
+#   -> Dry-run publish -> Confirm package unchanged -> Publish
 #
 # 'cargo package' compiles the packaged sources, which runs build
-# scripts. It is the only stage that executes crate code, so the real
-# publish passes --no-verify rather than compiling a second time with a
-# credential present.
+# scripts. Unsetting credentials is not a boundary against that code,
+# so for isolation verify in one job (dry_run) and upload from another
+# with expected_sha256, which skips compilation entirely.
 
 set -euo pipefail
 
@@ -29,13 +30,17 @@ max_bytes="${INPUT_MAX_CRATE_SIZE_BYTES:-10485760}"
 dry_run="${INPUT_DRY_RUN:-false}"
 permit_fail="${INPUT_PERMIT_FAIL:-false}"
 summary="${INPUT_SUMMARY:-true}"
+expected_sha256="${INPUT_EXPECTED_SHA256:-}"
 registry_token="${INPUT_REGISTRY_TOKEN:-}"
-# Keep the token out of the environment that build scripts inherit.
+# Keep the token out of the environment Cargo and its children inherit.
+# This does not hide it from same-user processes that read an
+# ancestor's /proc/<pid>/environ; see expected_sha256 for isolation.
 unset INPUT_REGISTRY_TOKEN
 
 crate_name=""
 crate_version=""
 crate_size=""
+crate_sha256=""
 published="false"
 stage="Check inputs"
 tag_result="Skipped"
@@ -85,6 +90,8 @@ trap finish EXIT
 # Build scripts and proc-macros run during 'cargo package'. Withhold
 # registry tokens, and the variables that mint GitHub OIDC tokens for
 # crates.io Trusted Publishing, from every stage except the upload.
+# Defence in depth only: same-user code can still read them from an
+# ancestor process. expected_sha256 keeps crate code out of the job.
 scrubbed_cargo() {
   env -u CARGO_REGISTRY_TOKEN -u CARGO_REGISTRIES_CRATES_IO_TOKEN \
     -u ACTIONS_ID_TOKEN_REQUEST_TOKEN -u ACTIONS_ID_TOKEN_REQUEST_URL \
@@ -92,10 +99,16 @@ scrubbed_cargo() {
 }
 
 # A prefix assignment, rather than an 'env NAME=value' argument, keeps
-# the token out of the process argument list.
+# the token out of the process argument list. An explicit token also
+# forces Cargo's built-in provider: a project .cargo/config.toml could
+# otherwise name a credential provider, which Cargo would run with the
+# token in its environment. Environment settings outrank config files.
 publishing_cargo() {
   if [ -n "$registry_token" ]; then
     CARGO_REGISTRY_TOKEN="$registry_token" \
+      CARGO_REGISTRY_CREDENTIAL_PROVIDER=cargo:token \
+      CARGO_REGISTRIES_CRATES_IO_CREDENTIAL_PROVIDER=cargo:token \
+      CARGO_REGISTRY_GLOBAL_CREDENTIAL_PROVIDERS=cargo:token \
       env -u ACTIONS_ID_TOKEN_REQUEST_TOKEN \
       -u ACTIONS_ID_TOKEN_REQUEST_URL cargo "$@"
   else
@@ -124,6 +137,18 @@ require_within_workspace() {
     "$workspace_real"/*) ;;
     *) fail "$1 must resolve within the workspace" ;;
   esac
+}
+
+# Print the SHA-256 digest of a file: sha256sum on Linux, shasum on
+# macOS.
+sha256_of() {
+  local digest
+  if command -v sha256sum > /dev/null 2>&1; then
+    digest="$(sha256sum < "$1")"
+  else
+    digest="$(shasum -a 256 < "$1")"
+  fi
+  printf '%s' "${digest%% *}"
 }
 
 # A crates.io token for Trusted Publishing is bound to the repository,
@@ -157,11 +182,20 @@ if [ -n "$release_tag" ] && [[ ! "$release_tag" =~ ^[0-9A-Za-z._+-]+$ ]]; then
   fail "release_tag may contain only: 0-9 A-Z a-z . _ + -"
 fi
 
+if [ -n "$expected_sha256" ] \
+  && [[ ! "$expected_sha256" =~ ^[0-9a-f]{64}$ ]]; then
+  fail "expected_sha256 must be 64 lowercase hexadecimal characters"
+fi
+
 for tool in cargo jq wc; do
   if ! command -v "$tool" > /dev/null 2>&1; then
     fail "required tool not found on PATH: $tool"
   fi
 done
+if ! command -v sha256sum > /dev/null 2>&1 \
+  && ! command -v shasum > /dev/null 2>&1; then
+  fail "required tool not found on PATH: sha256sum or shasum"
+fi
 
 workspace="${GITHUB_WORKSPACE:-$PWD}"
 if ! workspace_real="$(cd -- "$workspace" 2> /dev/null && pwd -P)"; then
@@ -181,6 +215,11 @@ esac
 manifest_file="$(resolve_against "$project_dir" "$manifest_path")"
 if [ ! -f "$manifest_file" ]; then
   fail "manifest_path does not exist below path_prefix"
+fi
+# 'pwd -P' below canonicalises the directory but not the file itself, so
+# a symlinked Cargo.toml could point outside the workspace unchecked.
+if [ -L "$manifest_file" ]; then
+  fail "manifest_path must not be a symlink"
 fi
 # Canonicalise once, for the containment check below, and hand cargo
 # that same path: cargo echoes the manifest path it was given, so the
@@ -252,8 +291,15 @@ fi
 
 ### Package ###
 
+# With expected_sha256, an earlier job has already compiled and
+# verified this archive, so package without running any crate code;
+# the digest check below proves the bytes are the ones it verified.
 stage="Package"
-scrubbed_cargo package --locked --manifest-path "$manifest_abs"
+if [ -n "$expected_sha256" ]; then
+  scrubbed_cargo package --no-verify --locked --manifest-path "$manifest_abs"
+else
+  scrubbed_cargo package --locked --manifest-path "$manifest_abs"
+fi
 
 ### Check package size ###
 
@@ -264,11 +310,25 @@ if [ ! -f "$crate_file" ]; then
 fi
 crate_size="$(wc -c < "$crate_file")"
 crate_size="${crate_size//[[:space:]]/}"
+crate_sha256="$(sha256_of "$crate_file")"
 write_output crate_size_bytes "$crate_size"
+write_output crate_sha256 "$crate_sha256"
 echo "$crate_name package size: $crate_size bytes (limit: $max_bytes)"
+echo "$crate_name package SHA-256: $crate_sha256"
 if [ "$crate_size" -gt "$max_bytes" ]; then
   fail "$crate_name package is $crate_size bytes, exceeding the" \
     "$max_bytes-byte limit"
+fi
+
+### Match verified digest ###
+
+if [ -n "$expected_sha256" ]; then
+  stage="Match verified digest"
+  if [ "$crate_sha256" != "$expected_sha256" ]; then
+    fail "$crate_name package does not match expected_sha256; not" \
+      "publishing"
+  fi
+  echo "$crate_name package matches expected_sha256 ✅"
 fi
 
 ### Dry-run publish ###
@@ -278,6 +338,22 @@ fi
 stage="Dry-run publish"
 scrubbed_cargo publish --dry-run --no-verify --locked --registry crates-io \
   --manifest-path "$manifest_abs"
+
+### Confirm package unchanged ###
+
+# Verification ran the crate's build scripts, and Cargo only checks
+# that they left the unpacked copy under target/package alone. A script
+# could still edit and commit the workspace sources, which the upload
+# would package afresh and never compile. Cargo cannot upload a
+# prebuilt archive, so repackage without running crate code and require
+# a byte-identical result: Cargo's archives are reproducible, and they
+# record the commit, so any change to the packaged inputs shows here.
+stage="Confirm package unchanged"
+scrubbed_cargo package --no-verify --locked --manifest-path "$manifest_abs"
+if [ ! -f "$crate_file" ] \
+  || [ "$(sha256_of "$crate_file")" != "$crate_sha256" ]; then
+  fail "$crate_name package changed after verification; not publishing"
+fi
 
 ### Publish ###
 

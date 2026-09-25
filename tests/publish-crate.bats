@@ -38,7 +38,8 @@ setup() {
   export MOCK_CRATE_SIZE=32
   unset INPUT_MANIFEST_PATH INPUT_RELEASE_TAG INPUT_MAX_CRATE_SIZE_BYTES
   unset INPUT_DRY_RUN INPUT_PERMIT_FAIL INPUT_SUMMARY INPUT_REGISTRY_TOKEN
-  unset MOCK_FAIL_STAGE MOCK_MISSING_PACKAGE MOCK_INVALID_METADATA
+  unset INPUT_EXPECTED_SHA256 CARGO_REGISTRY_CREDENTIAL_PROVIDER
+  unset MOCK_FAIL_STAGE MOCK_MISSING_PACKAGE MOCK_INVALID_METADATA MOCK_TAMPER
   unset MOCK_INCLUDE_OTHER_PACKAGE CARGO_TARGET_DIR
   unset CARGO_REGISTRY_TOKEN CARGO_REGISTRIES_CRATES_IO_TOKEN
   unset ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL
@@ -63,10 +64,20 @@ assert_no_cargo() {
 
 # Field N (1-based) of the recorded environment for a cargo stage:
 # 2 cwd, 3 CARGO_REGISTRY_TOKEN, 4 CARGO_REGISTRIES_CRATES_IO_TOKEN,
-# 5 ACTIONS_ID_TOKEN_REQUEST_TOKEN, 6 INPUT_REGISTRY_TOKEN.
+# 5 ACTIONS_ID_TOKEN_REQUEST_TOKEN, 6 INPUT_REGISTRY_TOKEN,
+# 7 CARGO_REGISTRY_CREDENTIAL_PROVIDER.
 stage_env() {
   awk -F'|' -v stage="$1" -v field="$2" \
     '$1 == stage { print $field }' "$MOCK_CARGO_ENV"
+}
+
+# SHA-256 of N zero bytes, the content the cargo stand-in packages.
+zero_sha256() {
+  if command -v sha256sum > /dev/null 2>&1; then
+    head -c "$1" /dev/zero | sha256sum | cut -d' ' -f1
+  else
+    head -c "$1" /dev/zero | shasum -a 256 | cut -d' ' -f1
+  fi
 }
 
 ### Default flow ###
@@ -75,8 +86,10 @@ stage_env() {
   run_action
 
   [ "$status" -eq 0 ]
-  assert_calls $'metadata\npackage\ndry-run\npublish'
-  [ "$(cat "$GITHUB_OUTPUT")" = $'crate_name=example-crate\ncrate_version=1.2.3\ncrate_size_bytes=32\npublished=true' ]
+  assert_calls $'metadata\npackage\ndry-run\nrepackage\npublish'
+  [ "$(cat "$GITHUB_OUTPUT")" = "$(printf '%s\n' crate_name=example-crate \
+    crate_version=1.2.3 crate_size_bytes=32 \
+    "crate_sha256=$(zero_sha256 32)" published=true)" ]
   [[ "$output" == *"Published example-crate 1.2.3 to crates.io"* ]]
 }
 
@@ -97,7 +110,7 @@ stage_env() {
   run_action
 
   [ "$status" -eq 0 ]
-  assert_calls $'metadata\npackage\ndry-run'
+  assert_calls $'metadata\npackage\ndry-run\nrepackage'
   grep -qx crate_size_bytes=32 "$GITHUB_OUTPUT"
   grep -qx published=false "$GITHUB_OUTPUT"
 }
@@ -319,6 +332,18 @@ stage_env() {
   assert_no_cargo
 }
 
+@test "rejects a symlinked Cargo.toml, even one pointing outside the workspace" {
+  mkdir -p "$BATS_TEST_TMPDIR/outside"
+  cp "$BATS_TEST_DIRNAME/fixtures/Cargo.toml" "$BATS_TEST_TMPDIR/outside/"
+  rm "$project/Cargo.toml"
+  ln -s "$BATS_TEST_TMPDIR/outside/Cargo.toml" "$project/Cargo.toml"
+  run_action
+
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"manifest_path must not be a symlink"* ]]
+  assert_no_cargo
+}
+
 @test "fails clearly when cargo is not on PATH" {
   local tool saved_path="$PATH"
   mkdir -p "$workdir/no-cargo"
@@ -396,12 +421,13 @@ stage_env() {
 
 @test "cargo failures stop the run, keep the exit code and name the stage" {
   local failure expected calls
-  for failure in metadata package dry-run publish; do
+  for failure in metadata package dry-run repackage publish; do
     case "$failure" in
       metadata) expected="Read crate metadata" calls=metadata ;;
       package) expected="Package" calls=$'metadata\npackage' ;;
       dry-run) expected="Dry-run publish" calls=$'metadata\npackage\ndry-run' ;;
-      publish) expected="Publish" calls=$'metadata\npackage\ndry-run\npublish' ;;
+      repackage) expected="Confirm package unchanged" calls=$'metadata\npackage\ndry-run\nrepackage' ;;
+      publish) expected="Publish" calls=$'metadata\npackage\ndry-run\nrepackage\npublish' ;;
     esac
     : > "$GITHUB_STEP_SUMMARY"
     : > "$GITHUB_OUTPUT"
@@ -428,6 +454,98 @@ stage_env() {
   [[ "$output" == *"cargo package did not produce example-crate-1.2.3.crate"* ]]
   assert_calls $'metadata\npackage'
   run ! grep -q '^crate_size_bytes=' "$GITHUB_OUTPUT"
+}
+
+### Package integrity ###
+
+@test "records the SHA-256 of the verified archive" {
+  export INPUT_DRY_RUN=true
+  run_action
+
+  [ "$status" -eq 0 ]
+  grep -qx "crate_sha256=$(zero_sha256 32)" "$GITHUB_OUTPUT"
+  [[ "$output" == *"package SHA-256: $(zero_sha256 32)"* ]]
+}
+
+@test "refuses to publish a package that changed after verification" {
+  export MOCK_TAMPER=true
+  run_action
+
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"example-crate package changed after verification; not publishing"* ]]
+  assert_calls $'metadata\npackage\ndry-run\nrepackage'
+  grep -qx published=false "$GITHUB_OUTPUT"
+  grep -Fx '| Result | Failed: Confirm package unchanged |' \
+    "$GITHUB_STEP_SUMMARY"
+}
+
+@test "a dry run also fails when the package changed after verification" {
+  export MOCK_TAMPER=true INPUT_DRY_RUN=true
+  run_action
+
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"package changed after verification"* ]]
+}
+
+@test "repackaging runs without registry tokens" {
+  export CARGO_REGISTRY_TOKEN="ambient token" INPUT_REGISTRY_TOKEN=input-token
+  run_action
+
+  [ "$status" -eq 0 ]
+  [ "$(stage_env repackage 3)" = unset ]
+  [ "$(stage_env repackage 6)" = unset ]
+}
+
+### expected_sha256: upload without compiling ###
+
+@test "expected_sha256 uploads the matching archive without compiling it" {
+  INPUT_EXPECTED_SHA256="$(zero_sha256 32)"
+  export INPUT_EXPECTED_SHA256
+  run_action
+
+  [ "$status" -eq 0 ]
+  assert_calls $'metadata\nrepackage\ndry-run\nrepackage\npublish'
+  [[ "$output" == *"example-crate package matches expected_sha256"* ]]
+  grep -qx published=true "$GITHUB_OUTPUT"
+}
+
+@test "expected_sha256 refuses a different archive before any upload" {
+  INPUT_EXPECTED_SHA256="$(zero_sha256 31)"
+  export INPUT_EXPECTED_SHA256
+  run_action
+
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"does not match expected_sha256; not publishing"* ]]
+  assert_calls $'metadata\nrepackage'
+  grep -Fx '| Result | Failed: Match verified digest |' "$GITHUB_STEP_SUMMARY"
+}
+
+@test "a dry run's crate_sha256 feeds expected_sha256 in a later run" {
+  export INPUT_DRY_RUN=true
+  run_action
+  [ "$status" -eq 0 ]
+  local digest
+  digest="$(sed -n 's/^crate_sha256=//p' "$GITHUB_OUTPUT")"
+
+  export INPUT_DRY_RUN=false INPUT_EXPECTED_SHA256="$digest"
+  : > "$MOCK_CARGO_LOG"
+  run_action
+
+  [ "$status" -eq 0 ]
+  run ! grep -qx package "$MOCK_CARGO_LOG"
+}
+
+@test "rejects a malformed expected_sha256 before running cargo" {
+  local digest
+  for digest in abc "$(zero_sha256 32 | tr 'a-f' 'A-F')" \
+    "$(zero_sha256 32)0" "$(zero_sha256 32 | cut -c2-)g"; do
+    export INPUT_EXPECTED_SHA256="$digest"
+    run_action
+
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"expected_sha256 must be 64 lowercase hexadecimal characters"* ]]
+    assert_no_cargo
+  done
 }
 
 ### permit_fail ###
@@ -468,7 +586,7 @@ stage_env() {
 
   [ "$status" -eq 0 ]
   local stage
-  for stage in metadata package dry-run; do
+  for stage in metadata package dry-run repackage; do
     [ "$(stage_env "$stage" 3)" = unset ]
     [ "$(stage_env "$stage" 4)" = unset ]
   done
@@ -484,7 +602,7 @@ stage_env() {
 
   [ "$status" -eq 0 ]
   local stage
-  for stage in metadata package dry-run publish; do
+  for stage in metadata package dry-run repackage publish; do
     [ "$(stage_env "$stage" 6)" = unset ]
   done
   [ "$(stage_env package 3)" = unset ]
@@ -510,6 +628,22 @@ stage_env() {
   assert_no_cargo
 }
 
+@test "registry_token forces Cargo's built-in token provider for the upload" {
+  export INPUT_REGISTRY_TOKEN=input-token
+  run_action
+
+  [ "$status" -eq 0 ]
+  [ "$(stage_env publish 7)" = cargo:token ]
+  [ "$(stage_env dry-run 7)" = unset ]
+}
+
+@test "without registry_token, the caller's credential provider stays in charge" {
+  run_action
+
+  [ "$status" -eq 0 ]
+  [ "$(stage_env publish 7)" = unset ]
+}
+
 @test "withholds GitHub OIDC request variables from every cargo stage" {
   export ACTIONS_ID_TOKEN_REQUEST_TOKEN="oidc-request-token"
   export ACTIONS_ID_TOKEN_REQUEST_URL="https://example.invalid/oidc"
@@ -517,7 +651,7 @@ stage_env() {
 
   [ "$status" -eq 0 ]
   local stage
-  for stage in metadata package dry-run publish; do
+  for stage in metadata package dry-run repackage publish; do
     [ "$(stage_env "$stage" 5)" = unset ]
   done
 }
@@ -639,7 +773,7 @@ MARKDOWN
   run_action
 
   [ "$status" -eq 0 ]
-  assert_calls $'metadata\npackage\ndry-run\npublish'
+  assert_calls $'metadata\npackage\ndry-run\nrepackage\npublish'
 }
 
 @test "summary write errors warn without replacing the exit status" {
@@ -679,20 +813,20 @@ MARKDOWN
   # shellcheck disable=SC2016 # the literal line from action.yaml
   grep -Fqx '      run: bash "$ACTION_PATH/scripts/publish-crate.sh"' \
     "$action_file"
-  declared="$(sed -n '/^inputs:/,/^outputs:/s/^  \([a-z_]*\):$/\1/p' \
+  declared="$(sed -n '/^inputs:/,/^outputs:/s/^  \([a-z0-9_]*\):$/\1/p' \
     "$action_file" | tr '[:lower:]' '[:upper:]' | sed 's/^/INPUT_/' | sort)"
-  passed="$(sed -n 's/^ *\(INPUT_[A-Z_]*\): .*/\1/p' "$action_file" | sort)"
-  consumed="$(grep -o 'INPUT_[A-Z][A-Z_]*' "$script" | sort -u)"
+  passed="$(sed -n 's/^ *\(INPUT_[A-Z0-9_]*\): .*/\1/p' "$action_file" | sort)"
+  consumed="$(grep -o 'INPUT_[A-Z][A-Z0-9_]*' "$script" | sort -u)"
   [ "$declared" = "$passed" ]
   [ "$passed" = "$consumed" ]
 }
 
 @test "action.yaml exposes the outputs the script writes" {
   local declared written
-  declared="$(sed -n '/^outputs:/,/^runs:/s/^  \([a-z_]*\):$/\1/p' \
+  declared="$(sed -n '/^outputs:/,/^runs:/s/^  \([a-z0-9_]*\):$/\1/p' \
     "$action_file" | sort)"
-  written="$(grep -o 'write_output [a-z_]*' "$script" \
+  written="$(grep -o 'write_output [a-z0-9_]*' "$script" \
     | awk '$2 != "" { print $2 }' | sort -u)"
   [ "$declared" = "$written" ]
-  [ "$(grep -c 'steps.publish.outputs.' "$action_file")" -eq 4 ]
+  [ "$(grep -c 'steps.publish.outputs.' "$action_file")" -eq 5 ]
 }

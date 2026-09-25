@@ -16,8 +16,13 @@ case "${1:-}" in
     expected=(metadata --no-deps --format-version 1 --manifest-path "$manifest")
     ;;
   package)
-    stage=package
-    expected=(package --locked --manifest-path "$manifest")
+    if [ "${2:-}" = "--no-verify" ]; then
+      stage=repackage
+      expected=(package --no-verify --locked --manifest-path "$manifest")
+    else
+      stage=package
+      expected=(package --locked --manifest-path "$manifest")
+    fi
     ;;
   publish)
     if [ "${2:-}" = "--dry-run" ]; then
@@ -37,11 +42,12 @@ case "${1:-}" in
 esac
 
 printf '%s\n' "$stage" >> "$MOCK_CARGO_LOG"
-printf '%s|%s|%s|%s|%s|%s\n' "$stage" "$(pwd -P)" \
+printf '%s|%s|%s|%s|%s|%s|%s\n' "$stage" "$(pwd -P)" \
   "${CARGO_REGISTRY_TOKEN-unset}" \
   "${CARGO_REGISTRIES_CRATES_IO_TOKEN-unset}" \
   "${ACTIONS_ID_TOKEN_REQUEST_TOKEN-unset}" \
-  "${INPUT_REGISTRY_TOKEN-unset}" >> "$MOCK_CARGO_ENV"
+  "${INPUT_REGISTRY_TOKEN-unset}" \
+  "${CARGO_REGISTRY_CREDENTIAL_PROVIDER-unset}" >> "$MOCK_CARGO_ENV"
 
 [ "$#" -eq "${#expected[@]}" ] || exit 91
 for argument in "${expected[@]}"; do
@@ -79,6 +85,16 @@ case "$stage" in
       mkdir -p "$MOCK_TARGET_DIRECTORY/package"
       head -c "$MOCK_CRATE_SIZE" /dev/zero \
         > "$MOCK_TARGET_DIRECTORY/package/example-crate-1.2.3.crate"
+    fi
+    ;;
+  repackage)
+    # Identical bytes, as Cargo's reproducible archives give, unless the
+    # test simulates sources changed after verification.
+    mkdir -p "$MOCK_TARGET_DIRECTORY/package"
+    head -c "$MOCK_CRATE_SIZE" /dev/zero \
+      > "$MOCK_TARGET_DIRECTORY/package/example-crate-1.2.3.crate"
+    if [ "${MOCK_TAMPER:-false}" = "true" ]; then
+      printf 'x' >> "$MOCK_TARGET_DIRECTORY/package/example-crate-1.2.3.crate"
     fi
     ;;
 esac
